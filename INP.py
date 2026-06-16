@@ -145,14 +145,14 @@ def sanitize_filename(name):
 def get_function_output_filename(func_ea, export_type):
     """根据导出类型生成函数输出文件名"""
     if export_type == "disassembly-fallback":
-        return "{:X}.asm".format(func_ea)
+        return "{:X}.s".format(func_ea)
     return "{:X}.c".format(func_ea)
 
 
 def get_function_output_subdir(export_type):
     """根据导出类型返回函数输出子目录"""
     if export_type == "disassembly-fallback":
-        return "disassembly"
+        return "disasm"
     return "decompile"
 
 
@@ -173,12 +173,19 @@ def get_function_output_path(export_dir, func_ea, export_type):
 
 def find_existing_function_output(export_dir, func_ea):
     """查找函数已有的导出文件"""
-    for export_type in ("decompile", "disassembly-fallback"):
+    for export_type in ("decompile", "decompile-failed"):
         output_filename = get_function_output_relative_path(func_ea, export_type)
         output_path = get_function_output_path(export_dir, func_ea, export_type)
         if os.path.exists(output_path):
             return output_filename, output_path
     return None, None
+
+
+def _format_comment_value(value):
+    """将文本安全写入 C 风格注释。"""
+    if value is None:
+        return ""
+    return str(value).replace("*/", "* /").replace("\r", " ").replace("\n", " ")
 
 
 def build_function_output_lines(func_ea, func_name, source_type, callers, callees, body, fallback_reason=None):
@@ -191,11 +198,26 @@ def build_function_output_lines(func_ea, func_name, source_type, callers, callee
     output_lines.append(" * callers: {}".format(format_address_list(callers) if callers else "none"))
     output_lines.append(" * callees: {}".format(format_address_list(callees) if callees else "none"))
     if fallback_reason:
-        output_lines.append(" * fallback-reason: {}".format(fallback_reason))
+        output_lines.append(" * fallback-reason: {}".format(_format_comment_value(fallback_reason)))
     output_lines.append(" */")
     output_lines.append("")
     output_lines.append(body)
     return output_lines
+
+
+def build_decompile_failure_body(fallback_reason, disasm_relative_path=None):
+    """构建反编译失败时写入 decompile/*.c 的说明内容。"""
+    reason = _format_comment_value(fallback_reason or "unknown")
+    output_lines = []
+    output_lines.append("/*")
+    output_lines.append(" * Decompilation failed.")
+    output_lines.append(" * reason: {}".format(reason))
+    if disasm_relative_path:
+        output_lines.append(" * disassembly: {}".format(disasm_relative_path))
+    output_lines.append(" */")
+    output_lines.append("")
+    output_lines.append("/* No pseudocode was generated for this function. */")
+    return "\n".join(output_lines)
 
 
 def generate_function_disassembly(func_ea):
@@ -543,7 +565,7 @@ class _FuncExportJob(object):
         中阻塞。此时 pipeline 已完全结束，不会有定时器冲突。
         """
         ensure_dir(os.path.join(self.export_dir, "decompile"))
-        ensure_dir(os.path.join(self.export_dir, "disassembly"))
+        ensure_dir(os.path.join(self.export_dir, "disasm"))
 
         if self.force_reexport:
             processed_addrs, prev_fallback, prev_failed, prev_skipped = set(), [], [], []
@@ -815,43 +837,60 @@ class _FuncExportJob(object):
                 logger.warning("Decompile timeout (%.1fs) for %s @ %s, added to blacklist",
                                decompile_elapsed, func_name, hex(func_ea))
 
+        disasm_body = None
+        disasm_relative_path = None
+        hard_failure_reason = None
+
         if output_body is None:
-            output_body, disasm_error = generate_function_disassembly(func_ea)
-            if output_body is None:
-                combined = fallback_reason or "unknown"
+            disasm_body, disasm_error = generate_function_disassembly(func_ea)
+            combined = fallback_reason or "unknown"
+            if disasm_body is None:
                 if disasm_error:
                     combined += "; disasm fallback failed: " + disasm_error
-                self.failed_funcs.append((func_ea, func_name, combined))
-                self.processed_addrs.add(func_ea)
-                self._last_func_status = "failed"
-                self._last_error_msg = combined
-                return
-            export_type = "disassembly-fallback"
+                hard_failure_reason = combined
+            else:
+                disasm_relative_path = get_function_output_relative_path(func_ea, "disassembly-fallback")
+            fallback_reason = combined
+            output_body = build_decompile_failure_body(fallback_reason, disasm_relative_path)
+            export_type = "decompile-failed"
 
         callers = get_callers(func_ea)
         callees = get_callees(func_ea)
 
         # 提交文件写入到 I/O 线程池（纯文件 I/O，不调用 IDA API）
-        job_args = (func_ea, func_name, output_body, callers, callees, export_type, fallback_reason)
+        job_args = (func_ea, func_name, output_body, disasm_body, callers, callees,
+                    export_type, fallback_reason, hard_failure_reason)
         export_dir = self.export_dir
 
         def _write(args):
-            ea, name, body, calrs, callrs, etype, freason = args
+            ea, name, body, asm_body, calrs, callrs, etype, freason, hard_failure = args
             lines = build_function_output_lines(ea, name, etype, calrs, callrs, body,
                                                 fallback_reason=freason)
             path = get_function_output_path(export_dir, ea, etype)
             try:
                 with open(path, 'w', encoding='utf-8') as f:
                     f.write('\n'.join(lines))
-                return True, get_function_output_relative_path(ea, etype), calrs, callrs, etype, freason, None
+                asm_out_fn = None
+                if asm_body is not None:
+                    asm_lines = build_function_output_lines(
+                        ea, name, "disassembly-fallback", calrs, callrs, asm_body,
+                        fallback_reason=freason)
+                    asm_path = get_function_output_path(export_dir, ea, "disassembly-fallback")
+                    with open(asm_path, 'w', encoding='utf-8') as f:
+                        f.write('\n'.join(asm_lines))
+                    asm_out_fn = get_function_output_relative_path(ea, "disassembly-fallback")
+                return (True, get_function_output_relative_path(ea, etype), asm_out_fn,
+                        calrs, callrs, etype, freason, hard_failure, None)
             except IOError as e:
-                return False, get_function_output_relative_path(ea, etype), calrs, callrs, etype, freason, str(e)
+                return (False, get_function_output_relative_path(ea, etype), None,
+                        calrs, callrs, etype, freason, hard_failure, str(e))
 
         future = self.io_executor.submit(_write, job_args)
-        self.pending_futures.append((future, func_ea, func_name, callers, callees, export_type, fallback_reason))
+        self.pending_futures.append((future, func_ea, func_name, callers, callees,
+                                     export_type, fallback_reason, hard_failure_reason))
 
         # 更新上一个函数的状态
-        if export_type == "disassembly-fallback":
+        if export_type == "decompile-failed":
             self._last_func_status = "fallback"
             self._last_error_msg = fallback_reason
         else:
@@ -866,29 +905,32 @@ class _FuncExportJob(object):
         """收集已完成的写入 future（非阻塞）。"""
         still_pending = []
         for item in self.pending_futures:
-            future, func_ea, func_name, callers, callees, export_type, fallback_reason = item
+            future, func_ea, func_name, callers, callees, export_type, fallback_reason, hard_failure_reason = item
             if not future.done():
                 still_pending.append(item)
                 continue
-            self._record_future_result(future, func_ea, func_name, callers, callees, export_type, fallback_reason)
+            self._record_future_result(future, func_ea, func_name, callers, callees,
+                                       export_type, fallback_reason, hard_failure_reason)
         self.pending_futures = still_pending
 
     def _flush_all_pending(self, wait=True):
         """等待所有挂起 future 完成并收集结果。"""
         for item in self.pending_futures:
-            future, func_ea, func_name, callers, callees, export_type, fallback_reason = item
+            future, func_ea, func_name, callers, callees, export_type, fallback_reason, hard_failure_reason = item
             try:
                 if wait:
                     future.result(timeout=60)
             except Exception:
                 pass
             if future.done():
-                self._record_future_result(future, func_ea, func_name, callers, callees, export_type, fallback_reason)
+                self._record_future_result(future, func_ea, func_name, callers, callees,
+                                           export_type, fallback_reason, hard_failure_reason)
         self.pending_futures = [item for item in self.pending_futures if not item[0].done()]
 
-    def _record_future_result(self, future, func_ea, func_name, callers, callees, export_type, fallback_reason):
+    def _record_future_result(self, future, func_ea, func_name, callers, callees,
+                              export_type, fallback_reason, hard_failure_reason):
         try:
-            success, out_fn, r_callers, r_callees, r_etype, r_freason, error = future.result(timeout=0)
+            success, out_fn, asm_out_fn, r_callers, r_callees, r_etype, r_freason, r_hard_failure, error = future.result(timeout=0)
         except Exception as e:
             self.failed_funcs.append((func_ea, func_name, "IO error: {}".format(str(e))))
             self.processed_addrs.add(func_ea)
@@ -901,11 +943,15 @@ class _FuncExportJob(object):
             }
             if r_freason:
                 func_info['fallback_reason'] = r_freason
+            if asm_out_fn:
+                func_info['disasm_filename'] = asm_out_fn
             self.function_index.append(func_info)
             self.addr_to_info[func_ea] = func_info
-            if r_etype == "disassembly-fallback":
+            if r_etype == "decompile-failed":
                 self.fallback_funcs.append((func_ea, func_name,
-                                            r_freason or "decompilation failed", out_fn))
+                                            r_freason or "decompilation failed", asm_out_fn or out_fn))
+                if r_hard_failure:
+                    self.failed_funcs.append((func_ea, func_name, r_hard_failure))
             self.exported_funcs += 1
             self.processed_addrs.add(func_ea)
         else:
@@ -1014,6 +1060,8 @@ class _FuncExportJob(object):
                     f.write("Function: {}\n".format(fi['name']))
                     f.write("Address: {}\n".format(hex(fi['address'])))
                     f.write("File: {}\n".format(fi['filename']))
+                    if 'disasm_filename' in fi:
+                        f.write("Disasm file: {}\n".format(fi['disasm_filename']))
                     f.write("Type: {}\n".format(fi['export_type']))
                     if 'fallback_reason' in fi:
                         f.write("Fallback reason: {}\n".format(fi['fallback_reason']))
@@ -1048,7 +1096,7 @@ def export_decompiled_functions(export_dir, skip_existing=True, force_reexport=F
     global _active_export_job
 
     ensure_dir(os.path.join(export_dir, "decompile"))
-    ensure_dir(os.path.join(export_dir, "disassembly"))
+    ensure_dir(os.path.join(export_dir, "disasm"))
 
     if force_reexport:
         processed_addrs, prev_fallback, prev_failed, prev_skipped = set(), [], [], []
@@ -1101,7 +1149,7 @@ def export_decompiled_functions(export_dir, skip_existing=True, force_reexport=F
 def export_decompiled_functions_sync(export_dir, skip_existing=True, force_reexport=False):
     """阻塞式导出函数，用于批处理模式。"""
     ensure_dir(os.path.join(export_dir, "decompile"))
-    ensure_dir(os.path.join(export_dir, "disassembly"))
+    ensure_dir(os.path.join(export_dir, "disasm"))
 
     job = _FuncExportJob(
         export_dir=export_dir,
@@ -1680,7 +1728,7 @@ class _ExportPipeline(object):
         _active_pipeline = self
 
         ensure_dir(os.path.join(self.export_dir, "decompile"))
-        ensure_dir(os.path.join(self.export_dir, "disassembly"))
+        ensure_dir(os.path.join(self.export_dir, "disasm"))
         ensure_dir(os.path.join(self.export_dir, "memory"))
 
         self._timer = ida_kernwin.register_timer(self.TIMER_INTERVAL_MS, self._tick)
