@@ -1,6 +1,0 @@
-{
-  "last_turn_at": "2026-06-16T05:14:16.650Z",
-  "turn_count": 1,
-  "last_progress_at": "2026-06-16T05:14:16.650Z",
-  "last_agent_output": "已修改 [INP.py](/home/woc/repo/IDA-NO-MCP/INP.py:145)。\n\n变更点：\n- 反汇编回退输出改为 `disasm/XXX.s`。\n- 成功反编译仍输出 `de"
-}
